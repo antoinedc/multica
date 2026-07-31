@@ -46,6 +46,18 @@ export default ({ config }: ConfigContext): ExpoConfig => {
         : isStaging
           ? "ai.multica.mobile.staging"
           : (process.env.EXPO_BUNDLE_IDENTIFIER_DEV ?? "ai.multica.mobile.dev"),
+      // App Store Connect rejects an upload whose build number it has already
+      // seen, so TestFlight needs a fresh one every time while the
+      // user-facing `version` above stays put. Direct-to-device builds never
+      // reach App Store Connect and are happy with the constant fallback.
+      buildNumber: process.env.EXPO_IOS_BUILD_NUMBER ?? "1",
+      infoPlist: {
+        // Multica only ever talks to its backend over HTTPS, which Apple
+        // exempts from export-compliance review. Declaring that here stops
+        // App Store Connect halting every single upload to ask the question
+        // by hand.
+        ITSAppUsesNonExemptEncryption: false,
+      },
     },
     plugins: [
       "expo-router",
