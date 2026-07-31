@@ -1,0 +1,649 @@
+name: ios-multica
+description: Build the Multica iOS app (Expo/React Native, apps/mobile) from the antoinedc/multica fork on this Mac. Installs onto a real iPhone over USB, onto the iOS Simulator, or archives and uploads a build to TestFlight. Also handles first-time setup, device discovery, the background Metro dev server, and reading back the full build logs.
+host: mac
+timeout: 30m
+
+inputs:
+  - id: action
+    type: enum
+    values: [preflight, setup, devices, device, simulator, testflight, tf-preflight, logs, metro, metro-stop, metro-status, clean]
+    default: preflight
+    description: "preflight = report Xcode/node/pnpm/repo/signing state and stop (read-only). setup = clone the fork if missing and install JS dependencies. devices = list every iPhone this Mac can see. device = build and install onto a real iPhone. simulator = build and install onto the iOS Simulator. tf-preflight = check everything TestFlight needs (distribution certificate, team id, App Store Connect key) without building. testflight = archive, export and upload a build to TestFlight. logs = print the tail of the most recent build log, which is the only way to see output the job log truncates. metro / metro-stop / metro-status = the background dev server Debug builds need. clean = delete the generated native project and Xcode build cache."
+  - id: env
+    type: enum
+    values: [production, staging, development]
+    default: production
+    description: "Which backend the build talks to. production = api.multica.ai, the same one multica.ai uses on the web. staging = the internal staging backend. development = a local backend, and needs apps/mobile/.env.development.local on the Mac."
+  - id: configuration
+    type: enum
+    values: [Release, Debug]
+    default: Release
+    description: "Release = standalone; the JS is baked in and it works with this Mac asleep. Debug = the app pulls its JS from the Metro dev server at launch. TestFlight always archives Release regardless of this setting."
+  - id: bundle_id
+    type: string
+    default: com.antoinedc.multica
+    description: "The iOS bundle identifier to sign with. The project default (ai.multica.mobile) belongs to the Multica organisation, and this Mac's Apple Developer account is a different team owning the com.antoinedc.* prefix. Only applies to the production and development variants; the staging id is fixed by the project."
+  - id: team_id
+    type: string
+    default: FSQ3HS4Z24
+    description: "Apple Developer team id used to sign a TestFlight archive. Defaults to the team owning the App Store Connect account, the com.antoinedc.multica bundle id and the Multica Dev record. This Mac also holds a certificate for a second, unrelated team, so leaving this to be guessed from the keychain picks the wrong one and the archive dies with 'No Account for Team'."
+  - id: device_name
+    type: string
+    default: ""
+    description: "Name of the iPhone to install onto. Matched case-insensitively, exact first then as a substring. Only consulted when device_id is empty."
+  - id: device_id
+    type: string
+    default: 00008110-00046C3802F0A01E
+    description: "UDID of the iPhone to install onto - defaults to the iPhone registered to this Apple Developer account. Empty falls back to device_name, or auto-picks when exactly one iPhone is connected."
+  - id: pull
+    type: boolean
+    default: true
+    description: Fetch and fast-forward the Mac's clone of the fork before building.
+  - id: branch
+    type: string
+    default: ""
+    description: Branch to check out before building. Empty stays on whatever the clone is already on.
+  - id: sync_upstream
+    type: boolean
+    default: false
+    description: Fast-forward the local main from multica-ai/multica before building. Reports and continues if the branch has diverged.
+  - id: reinstall_deps
+    type: boolean
+    default: false
+    description: Re-run the JS dependency install before building. Turn on after pulling a commit that changed package.json or the lockfile.
+  - id: lines
+    type: number
+    default: 60
+    description: How many lines of the build log the logs action prints.
+  - id: verbose
+    type: boolean
+    default: false
+    description: Print the full build log instead of just the error summary. Usually better to leave off and use action=logs, which is not truncated as aggressively.
+
+env:
+  REPO: ~/multica
+  REPO_URL: https://github.com/antoinedc/multica.git
+  UPSTREAM_URL: https://github.com/multica-ai/multica.git
+  MOBILE: apps/mobile
+  METRO_LOG: /tmp/multica-metro.log
+  METRO_PID: /tmp/multica-metro.pid
+  ASC_KEY_FILE: ~/.manta/asc-api-key.p8
+  TF_DIR: /tmp/multica-testflight
+
+steps:
+  - name: toolchain
+    run: |
+      exec 2>&1
+      export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+      # fnm / nvm put node outside the PATH a non-interactive shell inherits.
+      for c in "$HOME/.local/state/fnm_multishells" "$HOME/.nvm/versions/node"; do
+        [ -d "$c" ] || continue
+        N=$(ls -td "$c"/*/bin 2>/dev/null | head -1)
+        [ -n "$N" ] && export PATH="$N:$PATH"
+      done
+      echo "PATH=$PATH" > /tmp/multica-path.env
+
+      # The job log is truncated from the top, so the chatty report is only
+      # worth printing for actions where it is the point. Everything else
+      # stays quiet to leave room for output that actually matters.
+      case "$MANTA_INPUT_ACTION" in
+        logs|metro-status|metro-stop|devices) echo "ok"; exit 0 ;;
+      esac
+
+      OK=1
+      if X=$(xcodebuild -version 2>/dev/null | head -1); then echo "xcode    : $X"
+      else echo "xcode    : MISSING - install Xcode, then: sudo xcode-select -s /Applications/Xcode.app"; OK=0; fi
+      if N=$(node -v 2>/dev/null); then
+        echo "node     : $N"
+        MAJ=$(echo "$N" | sed 's/^v//' | cut -d. -f1)
+        if [ "$MAJ" -lt 20 ]; then
+          echo "           TOO OLD - react-native 0.83 needs node >= 20.19.4"
+          OK=0
+        fi
+      else echo "node     : MISSING - brew install node@22"; OK=0; fi
+      P=$(pnpm -v 2>/dev/null) && echo "pnpm     : $P" || echo "pnpm     : missing (setup enables it via corepack)"
+      if G=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null); then
+        echo "repo     : $G [$(git -C "$REPO" rev-parse --abbrev-ref HEAD)]"
+      else
+        echo "repo     : not cloned at $REPO (run action=setup)"
+      fi
+      [ "$OK" = "1" ] || exit 1
+
+  - name: signing identities
+    if: inputs.action == preflight
+    run: |
+      exec 2>&1
+      echo "codesigning identities:"
+      security find-identity -v -p codesigning 2>/dev/null | grep -E 'Apple (Development|Distribution)' | sed 's/^/  /' || echo "  (none)"
+      echo "A paid team signs for about a year; a free personal team for 7 days."
+
+  - name: clone
+    run: |
+      exec 2>&1
+      . /tmp/multica-path.env; export PATH
+      case "$MANTA_INPUT_ACTION" in setup) ;; *) echo "skipped"; exit 0 ;; esac
+      if [ -d "$REPO/.git" ]; then
+        echo "already cloned at $REPO"
+        git -C "$REPO" remote set-url origin "$REPO_URL"
+      else
+        git clone "$REPO_URL" "$REPO" || { echo "FAIL: clone failed"; exit 1; }
+        echo "cloned into $REPO"
+      fi
+      git -C "$REPO" remote get-url upstream >/dev/null 2>&1 \
+        || git -C "$REPO" remote add upstream "$UPSTREAM_URL"
+      echo "HEAD $(git -C "$REPO" rev-parse --short HEAD) [$(git -C "$REPO" rev-parse --abbrev-ref HEAD)]"
+
+  - name: sync
+    run: |
+      exec 2>&1
+      . /tmp/multica-path.env; export PATH
+      case "$MANTA_INPUT_ACTION" in device|simulator|metro|setup|testflight) ;; *) echo "skipped"; exit 0 ;; esac
+      cd "$REPO" || { echo "FAIL: no repo at $REPO - run action=setup"; exit 1; }
+      if [ "$MANTA_INPUT_PULL" = "true" ]; then
+        git fetch --all --prune --quiet 2>/dev/null || true
+        if [ -n "${MANTA_INPUT_BRANCH:-}" ]; then
+          git checkout --quiet "$MANTA_INPUT_BRANCH" 2>/dev/null || { echo "FAIL: no branch $MANTA_INPUT_BRANCH"; exit 1; }
+          git merge --ff-only "origin/$MANTA_INPUT_BRANCH" --quiet 2>/dev/null || true
+        else
+          git merge --ff-only @{u} --quiet 2>/dev/null || true
+        fi
+      fi
+      if [ "$MANTA_INPUT_SYNC_UPSTREAM" = "true" ]; then
+        git fetch --quiet upstream 2>/dev/null || true
+        git merge --ff-only upstream/main --quiet 2>/dev/null \
+          && echo "fast-forwarded onto upstream/main" \
+          || echo "NOTE: no fast-forward onto upstream/main (local commits) - continuing"
+      fi
+      echo "HEAD $(git rev-parse --short HEAD) [$(git rev-parse --abbrev-ref HEAD)]"
+
+  - name: install dependencies
+    run: |
+      exec 2>&1
+      . /tmp/multica-path.env; export PATH
+      case "$MANTA_INPUT_ACTION" in
+        setup) ;;
+        device|simulator|metro|testflight)
+          if [ "$MANTA_INPUT_REINSTALL_DEPS" != "true" ] && [ -d "$REPO/node_modules" ]; then
+            echo "skipped (already installed)"; exit 0
+          fi ;;
+        *) echo "skipped"; exit 0 ;;
+      esac
+      cd "$REPO" || { echo "FAIL: no repo at $REPO"; exit 1; }
+      if ! command -v pnpm >/dev/null 2>&1; then
+        corepack enable >/dev/null 2>&1 || true
+        corepack prepare pnpm@10.28.2 --activate >/dev/null 2>&1 || true
+      fi
+      command -v pnpm >/dev/null 2>&1 || { echo "FAIL: no pnpm. Try: npm i -g pnpm@10.28.2"; exit 1; }
+      LOG=/tmp/multica-install.log
+      # The whole workspace is installed because apps/mobile depends on the
+      # @multica/core workspace package.
+      if ! pnpm install --frozen-lockfile > "$LOG" 2>&1; then
+        echo "frozen-lockfile failed, retrying without it"
+        pnpm install >> "$LOG" 2>&1 || { tail -20 "$LOG"; echo "FAIL: pnpm install"; exit 1; }
+      fi
+      echo "DEPS: PASS"
+
+  - name: resolve environment
+    run: |
+      exec 2>&1
+      case "$MANTA_INPUT_ACTION" in device|simulator|metro|testflight) ;; *) echo "skipped"; exit 0 ;; esac
+      cd "$REPO" || { echo "FAIL: no repo at $REPO"; exit 1; }
+      case "$MANTA_INPUT_ENV" in
+        production)  ENVFILE="$MOBILE/.env.production" ;;
+        staging)     ENVFILE="$MOBILE/.env.staging" ;;
+        development) ENVFILE="$MOBILE/.env.development.local" ;;
+      esac
+      if [ ! -f "$ENVFILE" ]; then
+        echo "FAIL: $ENVFILE is missing."
+        [ "$MANTA_INPUT_ENV" = "development" ] && echo "Create it from $MOBILE/.env.example and point EXPO_PUBLIC_API_URL at this Mac's LAN IP."
+        exit 1
+      fi
+      {
+        echo "ENVFILE=$ENVFILE"
+        case "$MANTA_INPUT_ENV" in
+          production)  echo "APP_ENV=production" ;;
+          staging)     echo "APP_ENV=staging" ;;
+          development) echo "APP_ENV=development" ;;
+        esac
+        if [ -n "${MANTA_INPUT_BUNDLE_ID:-}" ]; then
+          case "$MANTA_INPUT_ENV" in
+            production)  echo "EXPO_BUNDLE_IDENTIFIER_PROD=$MANTA_INPUT_BUNDLE_ID" ;;
+            development) echo "EXPO_BUNDLE_IDENTIFIER_DEV=$MANTA_INPUT_BUNDLE_ID" ;;
+          esac
+        fi
+      } > /tmp/multica-build.env
+      echo "env=$MANTA_INPUT_ENV api=$(grep -m1 '^EXPO_PUBLIC_API_URL' "$ENVFILE" | cut -d= -f2)"
+
+  - name: find device
+    run: |
+      exec 2>&1
+      . /tmp/multica-path.env; export PATH
+      case "$MANTA_INPUT_ACTION" in device|devices) ;; *) echo "skipped"; exit 0 ;; esac
+      rm -f /tmp/multica-device-id /tmp/multica-device-pick.txt /tmp/multica-device-pick.err
+      JSON=/tmp/multica-devices.json
+      rm -f "$JSON"
+      xcrun devicectl list devices --json-output "$JSON" > /tmp/multica-devicectl.log 2>&1 || {
+        echo "FAIL: devicectl could not list devices (needs Xcode 15+)."
+        tail -6 /tmp/multica-devicectl.log
+        exit 1
+      }
+      LIST_ONLY=0
+      [ "$MANTA_INPUT_ACTION" = "devices" ] && LIST_ONLY=1
+      WANT_ID="${MANTA_INPUT_DEVICE_ID:-}" WANT_NAME="${MANTA_INPUT_DEVICE_NAME:-}" LIST_ONLY="$LIST_ONLY" \
+        python3 - "$JSON" > /tmp/multica-device-pick.txt 2>/tmp/multica-device-pick.err <<'PY'
+      import json, os, sys
+
+      try:
+          devices = json.load(open(sys.argv[1]))["result"]["devices"]
+      except Exception as exc:
+          sys.stderr.write("could not parse device list: %s\n" % exc)
+          raise SystemExit(1)
+
+      want_id = os.environ.get("WANT_ID", "").strip().lower()
+      want_name = os.environ.get("WANT_NAME", "").strip().lower()
+      list_only = os.environ.get("LIST_ONLY") == "1"
+
+      rows = []
+      for d in devices:
+          hw = d.get("hardwareProperties", {})
+          dp = d.get("deviceProperties", {})
+          cp = d.get("connectionProperties", {})
+          rows.append({
+              "udid": hw.get("udid") or d.get("identifier", ""),
+              "ident": d.get("identifier", "") or "",
+              "name": dp.get("name", "") or "",
+              "model": hw.get("marketingName", "") or "",
+              "os": dp.get("osVersionNumber", "") or "",
+              "platform": (hw.get("platform", "") or "").lower(),
+              "state": cp.get("tunnelState", "unknown"),
+          })
+
+      phones = [r for r in rows if "ios" in r["platform"] or "iphone" in r["platform"]] or rows
+
+      def show_all():
+          for r in phones:
+              print("AVAIL\t%s\t%s\t%s\t%s\t%s"
+                    % (r["name"], r["model"], r["os"], r["state"], r["udid"]))
+
+      if list_only:
+          print("LIST")
+          show_all()
+          raise SystemExit(0)
+
+      pick = None
+      if want_id:
+          pick = next((r for r in phones if want_id in (r["udid"].lower(), r["ident"].lower())), None)
+      if pick is None and want_name:
+          pick = next((r for r in phones if r["name"].lower() == want_name), None)
+      if pick is None and want_name:
+          pick = next((r for r in phones if want_name in r["name"].lower()), None)
+      # A configured id/name that is not plugged in must not silently install
+      # onto whatever else is attached, so only auto-pick when neither was set.
+      if pick is None and not want_name and not want_id and len(phones) == 1:
+          pick = phones[0]
+
+      if pick is None:
+          print("NOMATCH")
+          show_all()
+      else:
+          print("PICK\t%s\t%s\t%s\t%s"
+                % (pick["udid"], pick["name"], pick["model"], pick["state"]))
+      PY
+      if [ -s /tmp/multica-device-pick.err ]; then
+        echo "FAIL: could not read the device list"
+        tail -6 /tmp/multica-device-pick.err
+        exit 1
+      fi
+      if grep -q '^LIST' /tmp/multica-device-pick.txt; then
+        echo "iPhones this Mac can see:"
+        awk -F'\t' '/^AVAIL/{printf "  %-22s %-16s iOS %-8s %-12s %s\n", $2, $3, $4, $5, $6}' /tmp/multica-device-pick.txt
+        grep -q '^AVAIL' /tmp/multica-device-pick.txt \
+          || echo "  (none - plug it in, unlock, tap Trust, enable Developer Mode)"
+        exit 0
+      fi
+      if grep -q '^PICK' /tmp/multica-device-pick.txt; then
+        UDID=$(awk -F'\t' '/^PICK/{print $2}' /tmp/multica-device-pick.txt)
+        NAME=$(awk -F'\t' '/^PICK/{print $3}' /tmp/multica-device-pick.txt)
+        STATE=$(awk -F'\t' '/^PICK/{print $5}' /tmp/multica-device-pick.txt)
+        printf '%s' "$UDID" > /tmp/multica-device-id
+        echo "device: $NAME ($STATE)"
+      else
+        echo "FAIL: no iPhone matched name='${MANTA_INPUT_DEVICE_NAME}' id='${MANTA_INPUT_DEVICE_ID}'"
+        awk -F'\t' '/^AVAIL/{printf "  %-22s %-16s %-12s %s\n", $2, $3, $5, $6}' /tmp/multica-device-pick.txt
+        grep -q '^AVAIL' /tmp/multica-device-pick.txt || echo "  (none connected)"
+        exit 1
+      fi
+
+  - name: clean
+    if: inputs.action == clean
+    run: |
+      exec 2>&1
+      cd "$REPO" || { echo "FAIL: no repo at $REPO"; exit 1; }
+      rm -rf "$MOBILE/ios" "$MOBILE/.expo" "$TF_DIR"
+      rm -rf ~/Library/Developer/Xcode/DerivedData/App-* 2>/dev/null || true
+      echo "cleaned: native project, expo cache, Xcode DerivedData, TestFlight artefacts"
+      echo "next build regenerates from scratch (10-20 min)"
+
+  - name: build and install on iPhone
+    if: inputs.action == device
+    run: |
+      exec 2>&1
+      . /tmp/multica-path.env; export PATH
+      set -a; . /tmp/multica-build.env; set +a
+      cd "$REPO/$MOBILE" || { echo "FAIL: no $MOBILE in $REPO"; exit 1; }
+      UDID=$(cat /tmp/multica-device-id 2>/dev/null)
+      [ -n "$UDID" ] || { echo "FAIL: no device resolved"; exit 1; }
+      LOG=/tmp/multica-device-build.log
+      printf '%s' "$LOG" > /tmp/multica-last-log
+      # --no-bundler in both configurations: a Release build embeds the JS
+      # during the Xcode build, and a Debug build gets its JS from the
+      # detached Metro server started by action=metro.
+      npx dotenv -e "../../$ENVFILE" -- npx expo run:ios \
+        --device "$UDID" \
+        --configuration "$MANTA_INPUT_CONFIGURATION" \
+        --no-bundler > "$LOG" 2>&1
+      RC=$?
+      if [ "$MANTA_INPUT_VERBOSE" = "true" ]; then cat "$LOG"; fi
+      if [ "$RC" != "0" ]; then
+        echo "BUILD/INSTALL: FAIL (rc=$RC)"
+        grep -E 'error:|No profiles|Provisioning|code ?sign|Signing for' "$LOG" | head -12
+        echo "run action=logs for the full tail"
+        exit 1
+      fi
+      echo "INSTALL: PASS - $MANTA_INPUT_ENV / $MANTA_INPUT_CONFIGURATION"
+      echo "commit $(git -C "$REPO" rev-parse --short HEAD)"
+
+  - name: build and install on simulator
+    if: inputs.action == simulator
+    run: |
+      exec 2>&1
+      . /tmp/multica-path.env; export PATH
+      set -a; . /tmp/multica-build.env; set +a
+      cd "$REPO/$MOBILE" || { echo "FAIL: no $MOBILE in $REPO"; exit 1; }
+      LOG=/tmp/multica-sim-build.log
+      printf '%s' "$LOG" > /tmp/multica-last-log
+      open -a Simulator 2>/dev/null || true
+      npx dotenv -e "../../$ENVFILE" -- npx expo run:ios \
+        --configuration "$MANTA_INPUT_CONFIGURATION" --no-bundler > "$LOG" 2>&1
+      RC=$?
+      [ "$MANTA_INPUT_VERBOSE" = "true" ] && cat "$LOG"
+      [ "$RC" = "0" ] || { echo "SIMULATOR: FAIL (rc=$RC) - run action=logs"; exit 1; }
+      echo "SIMULATOR: PASS"
+
+  - name: testflight preflight
+    run: |
+      exec 2>&1
+      . /tmp/multica-path.env; export PATH
+      case "$MANTA_INPUT_ACTION" in testflight|tf-preflight) ;; *) echo "skipped"; exit 0 ;; esac
+      REPORT=/tmp/multica-tf-preflight.txt
+      : > "$REPORT"
+      printf '%s' "$REPORT" > /tmp/multica-last-log
+      OK=1
+
+      # Distribution certificate. Development certs cannot sign an App Store
+      # archive, so this is checked separately rather than folded into the
+      # generic identity list.
+      # Both spellings matter: Apple renamed the identity to "Apple
+      # Distribution", but certificates issued under the older scheme are still
+      # valid and still show up as "iOS Distribution".
+      DIST=$(security find-identity -v -p codesigning 2>/dev/null | grep -E 'Apple Distribution|iOS Distribution' | head -1)
+      DEV=$(security find-identity -v -p codesigning 2>/dev/null | grep 'Apple Development' | head -1)
+      if [ -n "$DIST" ]; then
+        echo "dist cert: present" >> "$REPORT"
+      else
+        # Absent is not fatal: -allowProvisioningUpdates lets xcodebuild mint a
+        # distribution certificate mid-archive, the same way Xcode.app does.
+        # Creating it by hand first is just more predictable.
+        echo "dist cert: absent - the archive will try to create one" >> "$REPORT"
+        echo "           safer: Xcode > Settings > Accounts > Manage Certificates > + Apple Distribution" >> "$REPORT"
+      fi
+
+      # Team id: explicit input wins, otherwise read it out of a certificate
+      # common name, which ends in (TEAMID). Either certificate type carries
+      # it, so the development one is a fine fallback before a distribution
+      # certificate exists.
+      TEAM="${MANTA_INPUT_TEAM_ID:-}"
+      if [ -z "$TEAM" ]; then
+        TEAM=$(printf '%s\n%s' "$DIST" "$DEV" | sed -nE 's/.*\(([A-Z0-9]{10})\).*/\1/p' | head -1)
+      fi
+      if [ -n "$TEAM" ]; then echo "team id  : $TEAM" >> "$REPORT"
+      else echo "team id  : could not derive - pass team_id" >> "$REPORT"; OK=0; fi
+      printf '%s' "$TEAM" > /tmp/multica-team-id
+
+      # The signing key is looked for where the notarize plugin keeps it, then
+      # in altool's own search paths.
+      KEY=""
+      for c in "$(eval echo "$ASC_KEY_FILE")" ~/.appstoreconnect/private_keys/AuthKey_*.p8 ~/private_keys/AuthKey_*.p8; do
+        [ -f "$c" ] && { KEY="$c"; break; }
+      done
+      if [ -n "$KEY" ]; then echo "asc key  : $KEY" >> "$REPORT"
+      else echo "asc key  : MISSING - looked in ~/.manta/ and ~/.appstoreconnect/private_keys/" >> "$REPORT"; OK=0; fi
+      printf '%s' "$KEY" > /tmp/multica-asc-key
+
+      # Key id and issuer come from files first: a non-interactive shell never
+      # reads ~/.zshrc, so anything exported from a shell profile is invisible
+      # here even though it works in Terminal. Environment and the
+      # AuthKey_<KEYID>.p8 filename are fallbacks.
+      KID=""
+      [ -f ~/.manta/asc-key-id ] && KID=$(tr -d ' \n' < ~/.manta/asc-key-id)
+      [ -z "$KID" ] && KID="${MANTA_ASC_KEY_ID:-}"
+      [ -z "$KID" ] && [ -n "$KEY" ] && KID=$(basename "$KEY" | sed -nE 's/^AuthKey_(.+)\.p8$/\1/p')
+      ISS=""
+      [ -f ~/.manta/asc-issuer-id ] && ISS=$(tr -d ' \n' < ~/.manta/asc-issuer-id)
+      [ -z "$ISS" ] && ISS="${MANTA_ASC_ISSUER_ID:-}"
+
+      if [ -n "$KID" ]; then echo "key id   : found" >> "$REPORT"
+      else echo "key id   : MISSING - write it to ~/.manta/asc-key-id" >> "$REPORT"; OK=0; fi
+      if [ -n "$ISS" ]; then echo "issuer   : found" >> "$REPORT"
+      else echo "issuer   : MISSING - write it to ~/.manta/asc-issuer-id" >> "$REPORT"; OK=0; fi
+      printf '%s' "$KID" > /tmp/multica-asc-kid
+      printf '%s' "$ISS" > /tmp/multica-asc-iss
+
+      [ "$OK" = "1" ] && echo "TF-PREFLIGHT: PASS" >> "$REPORT" || echo "TF-PREFLIGHT: FAIL" >> "$REPORT"
+      cat "$REPORT"
+      # A diagnostic that exits non-zero loses its own output, because a failed
+      # job returns no log tail. Only the real build is allowed to hard-fail.
+      [ "$MANTA_INPUT_ACTION" = "tf-preflight" ] && exit 0
+      [ "$OK" = "1" ] || exit 1
+
+  - name: testflight archive and upload
+    if: inputs.action == testflight
+    run: |
+      exec 2>&1
+      . /tmp/multica-path.env; export PATH
+      set -a; . /tmp/multica-build.env; set +a
+      cd "$REPO/$MOBILE" || { echo "FAIL: no $MOBILE in $REPO"; exit 1; }
+      LOG=/tmp/multica-testflight.log
+      printf '%s' "$LOG" > /tmp/multica-last-log
+      : > "$LOG"
+      TEAM=$(cat /tmp/multica-team-id)
+      KEY=$(cat /tmp/multica-asc-key)
+      KID=$(cat /tmp/multica-asc-kid)
+      ISS=$(cat /tmp/multica-asc-iss)
+      rm -rf "$TF_DIR"; mkdir -p "$TF_DIR"
+
+      # App Store Connect refuses a build number it has already seen. Seconds
+      # since the epoch is monotonic, fits CFBundleVersion, and needs no state
+      # carried between runs.
+      export EXPO_IOS_BUILD_NUMBER="$(date +%s)"
+      echo "build number: $EXPO_IOS_BUILD_NUMBER"
+
+      echo "== prebuild ==" >> "$LOG"
+      npx dotenv -e "../../$ENVFILE" -- npx expo prebuild --platform ios >> "$LOG" 2>&1 \
+        || { echo "FAIL: prebuild - run action=logs"; exit 1; }
+
+      WS=$(ls -d ios/*.xcworkspace 2>/dev/null | head -1)
+      [ -n "$WS" ] || { echo "FAIL: no xcworkspace after prebuild"; exit 1; }
+      # The workspace lists every CocoaPods dependency as a scheme too, and
+      # they sort ahead of the app: taking the first one archives something
+      # like `boost`, which builds fine and produces an archive containing no
+      # application. Expo names the app scheme after the workspace, so match
+      # that exactly and only fall back to first-listed if it is absent.
+      WSNAME=$(basename "$WS" .xcworkspace)
+      SCHEMES=$(xcodebuild -workspace "$WS" -list 2>/dev/null \
+        | awk '/Schemes:/{f=1;next} f&&NF{print $1}')
+      SCHEME=$(printf '%s\n' "$SCHEMES" | grep -Fx "$WSNAME" | head -1)
+      [ -z "$SCHEME" ] && SCHEME=$(printf '%s\n' "$SCHEMES" | head -1)
+      [ -n "$SCHEME" ] || { echo "FAIL: could not determine the Xcode scheme"; exit 1; }
+      echo "workspace: $WS  scheme: $SCHEME"
+
+      echo "== archive ==" >> "$LOG"
+      # -allowProvisioningUpdates lets xcodebuild mint the App Store profile
+      # the way Xcode.app would; the authentication flags let it do so without
+      # an interactive login.
+      xcodebuild -workspace "$WS" -scheme "$SCHEME" \
+        -configuration Release -destination 'generic/platform=iOS' \
+        -archivePath "$TF_DIR/Multica.xcarchive" \
+        -allowProvisioningUpdates \
+        -authenticationKeyPath "$KEY" \
+        -authenticationKeyID "$KID" \
+        -authenticationKeyIssuerID "$ISS" \
+        DEVELOPMENT_TEAM="$TEAM" \
+        COMPILER_INDEX_STORE_ENABLE=NO \
+        archive >> "$LOG" 2>&1
+      if [ $? != 0 ] || [ ! -d "$TF_DIR/Multica.xcarchive" ]; then
+        echo "ARCHIVE: FAIL"
+        grep -E 'error:|No profiles|Provisioning|code ?sign|Signing for' "$LOG" | head -12
+        echo "run action=logs for the full tail"
+        exit 1
+      fi
+      # An archive built from a library scheme succeeds and contains no app.
+      # Export then fails with a confusing "expected one {}", so catch it here
+      # where the cause is still obvious.
+      APP=$(ls -d "$TF_DIR/Multica.xcarchive/Products/Applications/"*.app 2>/dev/null | head -1)
+      if [ -z "$APP" ]; then
+        echo "ARCHIVE: no application inside - scheme '$SCHEME' is not the app"
+        echo "schemes offered by the workspace:"
+        printf '%s\n' "$SCHEMES" | sed 's/^/  /' | head -20
+        exit 1
+      fi
+      echo "archive: ok ($(basename "$APP"))"
+
+      # Apple renamed the App Store export method around Xcode 15.3, and which
+      # spelling a given Xcode accepts is not worth predicting - try the
+      # current name, fall back to the historical one.
+      IPA=""
+      for METHOD in app-store-connect app-store; do
+        rm -rf "$TF_DIR/export"
+        cat > "$TF_DIR/ExportOptions.plist" <<PLIST
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+      <plist version="1.0">
+      <dict>
+        <key>method</key><string>$METHOD</string>
+        <key>teamID</key><string>$TEAM</string>
+        <key>signingStyle</key><string>automatic</string>
+        <key>uploadSymbols</key><true/>
+      </dict>
+      </plist>
+      PLIST
+        echo "== export (method=$METHOD) ==" >> "$LOG"
+        xcodebuild -exportArchive \
+          -archivePath "$TF_DIR/Multica.xcarchive" \
+          -exportPath "$TF_DIR/export" \
+          -exportOptionsPlist "$TF_DIR/ExportOptions.plist" \
+          -allowProvisioningUpdates \
+          -authenticationKeyPath "$KEY" \
+          -authenticationKeyID "$KID" \
+          -authenticationKeyIssuerID "$ISS" >> "$LOG" 2>&1
+        IPA=$(ls "$TF_DIR/export"/*.ipa 2>/dev/null | head -1)
+        [ -n "$IPA" ] && { echo "export method: $METHOD"; break; }
+      done
+      if [ -z "$IPA" ]; then
+        echo "EXPORT: FAIL (tried app-store-connect and app-store)"
+        grep -E 'error:|Provisioning|code ?sign' "$LOG" | head -12
+        echo "run action=logs for the full tail"
+        exit 1
+      fi
+      echo "ipa: $(basename "$IPA")"
+
+      # altool only finds an API key in one of its own search paths, so the
+      # key is copied into the canonical one rather than passed by path.
+      mkdir -p ~/.appstoreconnect/private_keys
+      cp "$KEY" ~/.appstoreconnect/private_keys/AuthKey_${KID}.p8
+      chmod 600 ~/.appstoreconnect/private_keys/AuthKey_${KID}.p8
+
+      echo "== upload ==" >> "$LOG"
+      xcrun altool --upload-app -f "$IPA" -t ios \
+        --apiKey "$KID" --apiIssuer "$ISS" >> "$LOG" 2>&1
+      if [ $? != 0 ]; then
+        echo "UPLOAD: FAIL"
+        grep -iE 'error|not authorized|invalid|already exists' "$LOG" | head -12
+        echo "run action=logs for the full tail"
+        exit 1
+      fi
+      echo "UPLOAD: PASS - build $EXPO_IOS_BUILD_NUMBER sent to App Store Connect"
+      echo "commit $(git -C "$REPO" rev-parse --short HEAD)"
+      echo "Processing takes 5-15 min; TestFlight emails you when it is installable."
+
+  - name: logs
+    if: inputs.action == logs
+    run: |
+      exec 2>&1
+      LOG=$(cat /tmp/multica-last-log 2>/dev/null)
+      [ -n "$LOG" ] && [ -f "$LOG" ] || LOG=/tmp/multica-device-build.log
+      [ -f "$LOG" ] || { echo "no build log yet"; exit 0; }
+      N=${MANTA_INPUT_LINES%%.*}; [ -n "$N" ] || N=60
+      echo "$LOG ($(wc -l < "$LOG" | tr -d ' ') lines) - last $N:"
+      tail -n "$N" "$LOG"
+
+  - name: metro
+    if: inputs.action == metro
+    run: |
+      exec 2>&1
+      . /tmp/multica-path.env; export PATH
+      set -a; . /tmp/multica-build.env; set +a
+      cd "$REPO/$MOBILE" || { echo "FAIL: no $MOBILE in $REPO"; exit 1; }
+      if pgrep -f "expo start --dev-client" >/dev/null 2>&1; then
+        echo "Metro already running - stop it with action=metro-stop"
+        exit 0
+      fi
+      : > "$METRO_LOG"
+      # Detached so this run can finish; the phone talks to it while the Mac
+      # stays awake.
+      nohup npx dotenv -e "../../$ENVFILE" -- npx expo start --dev-client >> "$METRO_LOG" 2>&1 &
+      echo $! > "$METRO_PID"
+      sleep 15
+      if pgrep -f "expo start --dev-client" >/dev/null 2>&1; then
+        echo "METRO: running"
+        grep -Eo 'exp://[0-9.]+:[0-9]+' "$METRO_LOG" | sort -u | head -2
+      else
+        echo "METRO: failed to start"
+        tail -15 "$METRO_LOG"
+        exit 1
+      fi
+
+  - name: metro-stop
+    if: inputs.action == metro-stop
+    run: |
+      exec 2>&1
+      STOPPED=0
+      if [ -f "$METRO_PID" ] && kill -0 "$(cat "$METRO_PID")" 2>/dev/null; then
+        kill "$(cat "$METRO_PID")" 2>/dev/null; sleep 2
+        kill -9 "$(cat "$METRO_PID")" 2>/dev/null || true
+        STOPPED=1
+      fi
+      rm -f "$METRO_PID"
+      # npx spawns children, so the recorded pid is not always the server.
+      pkill -f "expo start --dev-client" 2>/dev/null && STOPPED=1
+      [ "$STOPPED" = "1" ] && echo "METRO: stopped" || echo "METRO: not running"
+
+  - name: metro-status
+    if: inputs.action == metro-status
+    run: |
+      exec 2>&1
+      if pgrep -f "expo start --dev-client" >/dev/null 2>&1; then
+        echo "METRO: running"
+        grep -Eo 'exp://[0-9.]+:[0-9]+' "$METRO_LOG" 2>/dev/null | sort -u | head -2
+        tail -10 "$METRO_LOG" 2>/dev/null
+      else
+        echo "METRO: not running"
+      fi
+
+  - name: next steps
+    if: inputs.action == preflight
+    run: |
+      exec 2>&1
+      echo "preflight only - nothing built."
+      echo "  setup -> devices -> device        install over USB"
+      echo "  tf-preflight -> testflight        upload to TestFlight"
