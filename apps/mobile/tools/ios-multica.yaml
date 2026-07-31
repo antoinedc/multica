@@ -453,6 +453,18 @@ steps:
       . /tmp/multica-path.env; export PATH
       set -a; . /tmp/multica-build.env; set +a
       cd "$REPO/$MOBILE" || { echo "FAIL: no $MOBILE in $REPO"; exit 1; }
+      # The JS bundle is produced by an Xcode build phase during the archive,
+      # not by prebuild, so EXPO_PUBLIC_* has to be present in xcodebuild's own
+      # environment. Wrapping only prebuild ships a bundle where
+      # process.env.EXPO_PUBLIC_API_URL is undefined, and apps/mobile/data/api.ts
+      # throws at module load - the app then crashes the instant it opens, with
+      # a perfectly clean build and upload behind it.
+      set -a; . "../../$ENVFILE"; set +a
+      if [ -z "${EXPO_PUBLIC_API_URL:-}" ]; then
+        echo "FAIL: EXPO_PUBLIC_API_URL is empty after loading $ENVFILE"
+        exit 1
+      fi
+      echo "api url: $EXPO_PUBLIC_API_URL"
       LOG=/tmp/multica-testflight.log
       printf '%s' "$LOG" > /tmp/multica-last-log
       : > "$LOG"
